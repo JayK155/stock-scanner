@@ -7,12 +7,16 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
+import logging
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 API_KEY = os.environ.get("POLYGON_API_KEY", "BjNzevikpEG7Yvnxbp0oVzS1MZ1K8TxA")
 BASE = "https://api.polygon.io"
 ET = pytz.timezone("America/New_York")
-DB = "alerts.db"
+DB = "/tmp/alerts.db"  # Use /tmp so it works on Railway
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -44,8 +48,9 @@ def init_db():
     """)
     con.commit()
     con.close()
+    log.info("DB initialized at %s", DB)
 
-def db():
+def get_db():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     return con
@@ -64,157 +69,200 @@ def is_market_hours():
 
 def get_prev_trading_day():
     d = datetime.now(ET).date() - timedelta(days=1)
-    while d.weekday() >= 5:  # skip weekends
+    while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime("%Y-%m-%d")
 
 def fetch(url):
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, timeout=20)
     r.raise_for_status()
     return r.json()
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
-scan_status = {"last": "Never", "next": "60s", "running": False, "log": "Ready — waiting for first scan."}
+scan_status = {
+    "last": "Never",
+    "running": False,
+    "log": "Ready — waiting for first scan.",
+    "scanned": 0
+}
 
 def run_scan():
     if scan_status["running"]:
+        log.info("Scan already running, skipping.")
         return
     scan_status["running"] = True
-    scan_status["log"] = "Fetching market data..."
+    scan_status["log"] = "Starting scan..."
     found = 0
     scanned = 0
 
     try:
         prev_day = get_prev_trading_day()
         today = get_et_date()
+        log.info("Scanning — prev_day=%s today=%s", prev_day, today)
 
-        # Step 1: Grouped daily — get all US stocks from previous day
-        scan_status["log"] = f"Pulling previous day data ({prev_day})..."
-        grouped = fetch(f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{prev_day}?adjusted=true&include_otc=false&apiKey={API_KEY}")
+        # Step 1: Grouped daily bars
+        scan_status["log"] = f"Fetching grouped daily data for {prev_day}..."
+        url = f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{prev_day}?adjusted=true&include_otc=false&apiKey={API_KEY}"
+        grouped = fetch(url)
 
-        if not grouped.get("results"):
-            scan_status["log"] = f"No data for {prev_day}. Market may have been closed."
+        results = grouped.get("results") or []
+        log.info("Grouped results count: %d", len(results))
+
+        if not results:
+            scan_status["log"] = f"No market data for {prev_day}. May be a holiday or weekend."
+            scan_status["running"] = False
             return
 
-        # Filter candidates: price $1–$25, volume > 15K, clean ticker
+        # Filter candidates
         candidates = [
-            r for r in grouped["results"]
+            r for r in results
             if 1 <= r.get("c", 0) <= 25
             and r.get("v", 0) >= 15000
             and r.get("T", "")
-            and r["T"].isalpha()
+            and r["T"].replace(".", "").isalpha()
             and len(r["T"]) <= 5
         ]
-        candidates = sorted(candidates, key=lambda x: x["v"], reverse=True)[:300]
+        candidates = sorted(candidates, key=lambda x: x.get("v", 0), reverse=True)[:300]
         scanned = len(candidates)
+        scan_status["scanned"] = scanned
+        log.info("Candidates after filter: %d", scanned)
 
-        # Build prev high map
+        if not candidates:
+            scan_status["log"] = "No candidates matched filter criteria."
+            scan_status["running"] = False
+            return
+
+        # Build prev high/close map
         prev_map = {r["T"]: {"prevHigh": r["h"], "prevClose": r["c"]} for r in candidates}
 
         # Step 2: Bulk snapshot
-        scan_status["log"] = f"Fetching live snapshots for {scanned} candidates..."
-        ticker_str = ",".join([c["T"] for c in candidates])
-        snap = fetch(f"{BASE}/v2/snapshot/locale/us/markets/stocks/tickers?tickers={requests.utils.quote(ticker_str)}&apiKey={API_KEY}")
+        scan_status["log"] = f"Fetching live snapshots for {scanned} stocks..."
+        ticker_str = ",".join(c["T"] for c in candidates)
+        snap_url = f"{BASE}/v2/snapshot/locale/us/markets/stocks/tickers?tickers={requests.utils.quote(ticker_str)}&apiKey={API_KEY}"
+        snap = fetch(snap_url)
 
-        if not snap.get("tickers"):
-            scan_status["log"] = "No snapshot data. Markets may be closed."
+        tickers = snap.get("tickers") or []
+        log.info("Snapshot tickers returned: %d", len(tickers))
+
+        if not tickers:
+            scan_status["log"] = "Snapshot returned no data. Check API key or market hours."
+            scan_status["running"] = False
             return
 
-        # Load already-alerted symbols for today to avoid duplicates
-        con = db()
-        alerted_today = set(row["symbol"] for row in con.execute("SELECT symbol FROM alerts WHERE date=?", (today,)).fetchall())
+        # Already alerted today
+        con = get_db()
+        alerted_today = set(row["symbol"] for row in con.execute(
+            "SELECT symbol FROM alerts WHERE date=?", (today,)
+        ).fetchall())
         con.close()
 
         new_alerts = []
-        for s in snap["tickers"]:
+        for s in tickers:
             sym = s.get("ticker", "")
-            if sym in alerted_today:
+            if not sym or sym in alerted_today:
                 continue
+
             prev = prev_map.get(sym)
             if not prev:
                 continue
 
             prev_high = prev["prevHigh"]
             prev_close = prev["prevClose"]
-            today_price = s.get("day", {}).get("c") or s.get("lastTrade", {}).get("p")
-            today_vol = s.get("day", {}).get("v", 0)
+
+            day = s.get("day") or {}
+            last_trade = s.get("lastTrade") or {}
+            last_quote = s.get("lastQuote") or {}
+
+            today_price = day.get("c") or last_trade.get("p") or last_quote.get("P")
+            today_vol   = day.get("v") or 0
 
             if not today_price or not prev_high:
                 continue
-            if today_price < 1 or today_price > 25:
+            if not (1 <= today_price <= 25):
                 continue
             if today_vol < 15000:
                 continue
             if today_price <= prev_high:
                 continue
 
-            break_pct = round(((today_price - prev_high) / prev_high) * 100, 2)
+            break_pct  = round(((today_price - prev_high) / prev_high) * 100, 2)
             change_pct = round(((today_price - prev_close) / prev_close) * 100, 2) if prev_close else 0
 
             new_alerts.append({
-                "symbol": sym,
-                "name": sym,
-                "price": round(today_price, 2),
-                "prev_high": round(prev_high, 2),
-                "volume": int(today_vol),
-                "float_m": None,
+                "symbol":     sym,
+                "name":       sym,
+                "price":      round(today_price, 2),
+                "prev_high":  round(prev_high, 2),
+                "volume":     int(today_vol),
+                "float_m":    None,
                 "change_pct": change_pct,
-                "break_pct": break_pct,
-                "exchange": "",
+                "break_pct":  break_pct,
+                "exchange":   "",
                 "scanned_at": get_et_time(),
-                "date": today
+                "date":       today
             })
 
-        # Step 3: Enrich top results with name, exchange, float
-        scan_status["log"] = f"Found {len(new_alerts)} breakout(s)! Enriching data..."
-        for i, alert in enumerate(new_alerts[:20]):
+        log.info("Raw breakouts found: %d", len(new_alerts))
+
+        # Step 3: Enrich with name/exchange/float (top 15 only to stay within rate limits)
+        scan_status["log"] = f"Found {len(new_alerts)} breakout(s)! Enriching company data..."
+        enriched = []
+        for alert in new_alerts[:15]:
             try:
                 det = fetch(f"{BASE}/v3/reference/tickers/{alert['symbol']}?apiKey={API_KEY}")
-                if det.get("results"):
-                    r = det["results"]
-                    alert["name"] = r.get("name", alert["symbol"])
-                    alert["exchange"] = r.get("primary_exchange", "")
-                    shares = r.get("share_class_shares_outstanding")
-                    if shares:
-                        alert["float_m"] = round(shares / 1e6, 1)
-                        if alert["float_m"] > 25:  # float filter
-                            new_alerts[i] = None
-                            continue
-                time.sleep(0.12)
-            except:
-                pass
+                r = det.get("results") or {}
+                alert["name"]     = r.get("name", alert["symbol"])
+                alert["exchange"] = r.get("primary_exchange", "")
+                shares = r.get("share_class_shares_outstanding")
+                if shares:
+                    alert["float_m"] = round(shares / 1e6, 1)
+                    if alert["float_m"] > 25:
+                        log.info("Skipping %s — float %.1fM > 25M", alert["symbol"], alert["float_m"])
+                        time.sleep(0.15)
+                        continue
+                enriched.append(alert)
+                time.sleep(0.15)
+            except Exception as e:
+                log.warning("Enrich error for %s: %s", alert["symbol"], e)
+                enriched.append(alert)  # keep it anyway without enrichment
 
-        new_alerts = [a for a in new_alerts if a is not None]
-        found = len(new_alerts)
+        # Also add any beyond top 15 without enrichment
+        if len(new_alerts) > 15:
+            enriched += new_alerts[15:]
 
-        # Save to DB
-        if new_alerts:
-            con = db()
-            for a in new_alerts:
+        found = len(enriched)
+
+        if enriched:
+            con = get_db()
+            for a in enriched:
                 con.execute("""
-                    INSERT INTO alerts (symbol,name,price,prev_high,volume,float_m,change_pct,break_pct,exchange,scanned_at,date)
+                    INSERT INTO alerts
+                      (symbol,name,price,prev_high,volume,float_m,change_pct,break_pct,exchange,scanned_at,date)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """, (a["symbol"],a["name"],a["price"],a["prev_high"],a["volume"],
-                      a["float_m"],a["change_pct"],a["break_pct"],a["exchange"],a["scanned_at"],a["date"]))
+                """, (a["symbol"], a["name"], a["price"], a["prev_high"], a["volume"],
+                      a["float_m"], a["change_pct"], a["break_pct"], a["exchange"],
+                      a["scanned_at"], a["date"]))
             con.commit()
             con.close()
+            log.info("Saved %d alerts to DB", found)
 
         scan_status["last"] = get_et_time()
-        scan_status["log"] = f"✓ Scan complete — {found} breakout(s) from {scanned} stocks. Next scan in 60s."
+        scan_status["log"]  = f"✓ Scan complete — {found} breakout(s) from {scanned} stocks scanned. Next in 60s."
 
-        # Log the scan
-        con = db()
+        con = get_db()
         con.execute("INSERT INTO scan_log (scanned_at,scanned,found,status) VALUES (?,?,?,?)",
                     (get_et_time(), scanned, found, "ok"))
         con.commit()
         con.close()
 
     except Exception as e:
-        scan_status["log"] = f"Error: {str(e)}"
+        msg = str(e)
+        log.error("Scan error: %s", msg)
+        scan_status["log"] = f"Error during scan: {msg}"
         try:
-            con = db()
+            con = get_db()
             con.execute("INSERT INTO scan_log (scanned_at,scanned,found,status) VALUES (?,?,?,?)",
-                        (get_et_time(), scanned, 0, f"error: {str(e)[:200]}"))
+                        (get_et_time(), scanned, 0, f"error:{msg[:200]}"))
             con.commit()
             con.close()
         except:
@@ -226,7 +274,7 @@ def run_scan():
 @app.route("/api/alerts")
 def api_alerts():
     today = get_et_date()
-    con = db()
+    con = get_db()
     rows = con.execute(
         "SELECT * FROM alerts WHERE date=? ORDER BY id DESC LIMIT 100", (today,)
     ).fetchall()
@@ -236,37 +284,60 @@ def api_alerts():
 @app.route("/api/status")
 def api_status():
     today = get_et_date()
-    con = db()
+    con = get_db()
     today_count = con.execute("SELECT COUNT(*) FROM alerts WHERE date=?", (today,)).fetchone()[0]
     total_count = con.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
-    last_scan = con.execute("SELECT * FROM scan_log ORDER BY id DESC LIMIT 1").fetchone()
+    last_log    = con.execute("SELECT * FROM scan_log ORDER BY id DESC LIMIT 1").fetchone()
     con.close()
     return jsonify({
-        "last_scan": scan_status["last"],
-        "running": scan_status["running"],
-        "log": scan_status["log"],
+        "last_scan":    scan_status["last"],
+        "running":      scan_status["running"],
+        "log":          scan_status["log"],
         "market_hours": is_market_hours(),
-        "today_count": today_count,
-        "total_count": total_count,
-        "scanned": dict(last_scan)["scanned"] if last_scan else 0
+        "today_count":  today_count,
+        "total_count":  total_count,
+        "scanned":      dict(last_log)["scanned"] if last_log else scan_status["scanned"],
+        "api_key_set":  bool(API_KEY)
     })
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
     if not scan_status["running"]:
-        threading.Thread(target=run_scan).start()
-    return jsonify({"ok": True})
+        threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"ok": True, "running": scan_status["running"]})
 
 @app.route("/api/clear", methods=["POST"])
 def api_clear():
     today = get_et_date()
-    con = db()
+    con = get_db()
     con.execute("DELETE FROM alerts WHERE date=?", (today,))
     con.commit()
     con.close()
     return jsonify({"ok": True})
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+@app.route("/api/debug")
+def api_debug():
+    """Debug endpoint — shows raw API responses to help diagnose issues."""
+    try:
+        prev_day = get_prev_trading_day()
+        url = f"{BASE}/v2/aggs/grouped/locale/us/market/stocks/{prev_day}?adjusted=true&include_otc=false&apiKey={API_KEY}"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        count = len(data.get("results") or [])
+        sample = (data.get("results") or [])[:3]
+        return jsonify({
+            "status_code": r.status_code,
+            "prev_day": prev_day,
+            "results_count": count,
+            "sample": sample,
+            "api_key_prefix": API_KEY[:6] + "...",
+            "error": data.get("error"),
+            "message": data.get("message")
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── Dashboard HTML ─────────────────────────────────────────────────────────────
 DASHBOARD = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -313,13 +384,12 @@ DASHBOARD = """<!DOCTYPE html>
   .btn-green{background:#0d4429;border-color:#238636;color:#3fb950}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
   .scanning{animation:pulse 0.8s infinite}
-  #table-wrap{margin:16px 24px 28px;border:1px solid #21262d;border-radius:10px;overflow:hidden}
+  #table-wrap{margin:16px 24px 4px;border:1px solid #21262d;border-radius:10px;overflow:hidden}
   #table-header{background:#161b22;padding:13px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:10px}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
   .live-dot{width:8px;height:8px;background:#3fb950;border-radius:50%;display:inline-block;animation:blink 1.5s infinite}
   .section-title{font-family:'Space Grotesk',sans-serif;font-size:15px;font-weight:600}
   .count-badge{background:#1f6feb;color:#fff;border-radius:100px;padding:2px 9px;font-size:11px;font-weight:700}
-  #market-status{margin-left:auto;font-size:11px}
   .col-heads{display:grid;grid-template-columns:70px 1fr 105px 95px 80px 90px 100px 95px;gap:8px;padding:8px 16px;border-bottom:1px solid #30363d}
   .col-h{font-size:10px;color:#7d8590;text-transform:uppercase;letter-spacing:0.8px;font-weight:600}
   #alerts-body{max-height:500px;overflow-y:auto}
@@ -332,10 +402,10 @@ DASHBOARD = """<!DOCTYPE html>
   .price-val{font-size:13px;font-weight:600}
   .chg-pos{font-size:11px;color:#3fb950;font-weight:600}
   .chg-neg{font-size:11px;color:#f85149;font-weight:600}
-  .vol{font-size:12px;color:#c9d1d9}
-  .flt{font-size:12px;color:#e3b341}
-  .brk{background:#0d2d1a;border:1px solid #238636;color:#3fb950;padding:3px 8px;border-radius:5px;font-size:11px;font-weight:600}
+  .vol,.flt,.tm{font-size:12px;color:#c9d1d9}
+  .flt{color:#e3b341}
   .tm{font-size:11px;color:#7d8590}
+  .brk{background:#0d2d1a;border:1px solid #238636;color:#3fb950;padding:3px 8px;border-radius:5px;font-size:11px;font-weight:600}
   .exch-badge{font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600}
   .exch-nasdaq{background:#0c2d6b;color:#58a6ff;border:1px solid #1f6feb}
   .exch-nyse{background:#2d1b00;color:#e3b341;border:1px solid #9e6a03}
@@ -344,10 +414,13 @@ DASHBOARD = """<!DOCTYPE html>
   #empty-state .big{font-size:40px;margin-bottom:12px}
   #empty-state p{font-size:13px;line-height:1.7}
   #empty-state strong{color:#58a6ff}
-  #log-bar{padding:10px 24px;font-size:11px;color:#484f58;border-top:1px solid #21262d;background:#0d1117}
-  .log-error{color:#f85149}
-  .log-success{color:#3fb950}
-  .log-info{color:#58a6ff}
+  #log-bar{margin:0 24px 8px;padding:10px 16px;font-size:11px;color:#484f58;border:1px solid #21262d;border-top:none;border-radius:0 0 10px 10px;background:#161b22}
+  .log-error{color:#f85149 !important}
+  .log-success{color:#3fb950 !important}
+  .log-info{color:#58a6ff !important}
+  #debug-link{text-align:right;padding:4px 24px 16px;font-size:10px;color:#30363d}
+  #debug-link a{color:#30363d;text-decoration:none}
+  #debug-link a:hover{color:#484f58}
 </style>
 </head>
 <body>
@@ -402,15 +475,16 @@ DASHBOARD = """<!DOCTYPE html>
     <div class="col-h">Exchange</div><div class="col-h">Time ET</div>
   </div>
   <div id="alerts-body">
-    <div id="empty-state"><div class="big">📭</div><p>Waiting for scan results...<br/>The server scans automatically every <strong>60 seconds</strong>.</p></div>
+    <div id="empty-state"><div class="big">📭</div><p>No alerts yet.<br/>Click <strong>Scan Now</strong> or wait for auto-scan.</p></div>
   </div>
 </div>
-<div id="log-bar">⬡ Connecting to scanner...</div>
+<div id="log-bar">⬡ Connecting...</div>
+<div id="debug-link"><a href="/api/debug" target="_blank">api debug</a> · <a href="/api/status" target="_blank">status</a></div>
 
 <script>
-let allAlerts = [];
-let countdown = 60;
-let knownIds = new Set();
+let allAlerts=[];
+let countdown=60;
+let knownIds=new Set();
 
 function fmtVol(v){if(!v)return"–";if(v>=1e6)return(v/1e6).toFixed(1)+"M";if(v>=1e3)return(v/1e3).toFixed(1)+"K";return""+v;}
 function exchLabel(ex){
@@ -424,26 +498,31 @@ function exchLabel(ex){
 async function fetchStatus(){
   try{
     const r=await fetch("/api/status");
+    if(!r.ok)throw new Error("HTTP "+r.status);
     const s=await r.json();
     document.getElementById("last-scan").textContent=s.last_scan||"--";
-    document.getElementById("s-today").textContent=s.today_count;
-    document.getElementById("s-total").textContent=s.total_count;
-    document.getElementById("s-scanned").textContent=s.scanned;
-    const log=document.getElementById("log-bar");
-    log.textContent="⬡ "+s.log;
-    log.className=s.log.startsWith("✓")?"log-success":s.log.startsWith("Error")?"log-error":"log-info";
+    document.getElementById("s-today").textContent=s.today_count||0;
+    document.getElementById("s-total").textContent=s.total_count||0;
+    document.getElementById("s-scanned").textContent=s.scanned||0;
+    const logEl=document.getElementById("log-bar");
+    logEl.textContent="⬡ "+s.log;
+    logEl.className=s.log.startsWith("✓")?"log-success":s.log.startsWith("Error")?"log-error":"log-info";
     const ms=document.getElementById("market-status");
     ms.textContent=s.market_hours?"● Market Hours Active":"● Outside Market Hours";
     ms.style.color=s.market_hours?"#3fb950":"#f85149";
     const btn=document.getElementById("scan-btn");
     if(s.running){btn.textContent="⟳ Scanning...";btn.classList.add("scanning");btn.disabled=true;}
     else{btn.textContent="⟳ Scan Now";btn.classList.remove("scanning");btn.disabled=false;}
-  }catch(e){}
+  }catch(e){
+    document.getElementById("log-bar").textContent="⬡ Cannot reach server: "+e.message;
+    document.getElementById("log-bar").className="log-error";
+  }
 }
 
 async function fetchAlerts(){
   try{
     const r=await fetch("/api/alerts");
+    if(!r.ok)return;
     const data=await r.json();
     const newOnes=data.filter(a=>!knownIds.has(a.id));
     newOnes.forEach(a=>knownIds.add(a.id));
@@ -462,16 +541,16 @@ function renderAlerts(list){
   document.getElementById("alert-count").textContent=list.length;
   const body=document.getElementById("alerts-body");
   if(!list.length){
-    body.innerHTML='<div id="empty-state"><div class="big">📭</div><p>No alerts yet.<br/>The server scans automatically every <strong>60 seconds</strong>.</p></div>';
+    body.innerHTML='<div id="empty-state"><div class="big">📭</div><p>No alerts yet.<br/>Click <strong>Scan Now</strong> — results appear here automatically.</p></div>';
     return;
   }
   body.innerHTML=list.map(a=>`
     <div class="alert-row ${a.isNew?'row-new':''}">
       <div class="sym">${a.symbol}</div>
       <div class="company" title="${a.name}">${a.name}</div>
-      <div><div class="price-val">$${(+a.price).toFixed(2)}</div><div class="${a.change_pct>=0?'chg-pos':'chg-neg'}">${a.change_pct>=0?'+':''}${(+a.change_pct).toFixed(2)}%</div></div>
+      <div><div class="price-val">$${(+a.price).toFixed(2)}</div><div class="${+a.change_pct>=0?'chg-pos':'chg-neg'}">${+a.change_pct>=0?'+':''}${(+a.change_pct).toFixed(2)}%</div></div>
       <div class="vol">${fmtVol(a.volume)}</div>
-      <div class="flt">${a.float_m!==null&&a.float_m!==undefined?a.float_m+'M':'–'}</div>
+      <div class="flt">${a.float_m!=null?a.float_m+'M':'–'}</div>
       <div><span class="brk">+${(+a.break_pct).toFixed(2)}%</span></div>
       <div>${exchLabel(a.exchange)}</div>
       <div class="tm">${a.scanned_at}</div>
@@ -479,40 +558,40 @@ function renderAlerts(list){
 }
 
 async function triggerScan(){
+  document.getElementById("scan-btn").textContent="⟳ Scanning...";
+  document.getElementById("scan-btn").disabled=true;
   await fetch("/api/scan",{method:"POST"});
   countdown=60;
-  setTimeout(fetchStatus,500);
-  setTimeout(fetchAlerts,3000);
+  // Poll quickly after triggering
+  setTimeout(fetchStatus,1000);
+  setTimeout(fetchStatus,4000);
+  setTimeout(fetchAlerts,5000);
+  setTimeout(fetchAlerts,10000);
 }
 
 async function clearAlerts(){
-  if(!confirm("Clear today's alerts?"))return;
+  if(!confirm("Clear today's alerts from the database?"))return;
   await fetch("/api/clear",{method:"POST"});
-  allAlerts=[];knownIds.clear();
-  filterAlerts();
+  allAlerts=[];knownIds.clear();filterAlerts();
 }
 
 function exportCSV(){
   if(!allAlerts.length){alert("No alerts to export.");return;}
   const csv=["Symbol,Name,Price,Change%,Volume,Float,Break%,PrevHigh,Exchange,Time",
     ...allAlerts.map(a=>`${a.symbol},"${a.name}",${a.price},${a.change_pct}%,${a.volume},${a.float_m?a.float_m+'M':'N/A'},+${a.break_pct}%,$${a.prev_high},${a.exchange},${a.scanned_at}`)
-  ].join("\n");
+  ].join("\\n");
   const url=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
   Object.assign(document.createElement("a"),{href:url,download:"stock-alerts.csv"}).click();
 }
 
-// Clock
 setInterval(()=>{
   document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-US",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
   countdown=countdown<=1?60:countdown-1;
   document.getElementById("countdown").textContent=countdown+"s";
 },1000);
 
-// Poll server every 10s
 setInterval(fetchStatus,10000);
-setInterval(fetchAlerts,15000);
-
-// Initial load
+setInterval(fetchAlerts,12000);
 fetchStatus();
 fetchAlerts();
 </script>
@@ -523,11 +602,18 @@ fetchAlerts();
 def dashboard():
     return render_template_string(DASHBOARD)
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
+# ── App startup — works with both `python app.py` AND gunicorn ────────────────
+def startup():
     init_db()
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_scan, "interval", minutes=1, id="scanner")
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(run_scan, "interval", minutes=1, id="scanner", max_instances=1)
     scheduler.start()
+    log.info("Scheduler started — scan will run every 60 seconds.")
+    # Run first scan immediately on startup
+    threading.Thread(target=run_scan, daemon=True).start()
+
+startup()  # Called at import time — works for gunicorn AND direct python
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
